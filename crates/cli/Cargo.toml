@@ -1,0 +1,13 @@
+[package]
+name = "danger-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+danger-kernel = { path = "../kernel" }
+danger-runtime = { path = "../runtime" }
+danger-tools = { path = "../tools" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

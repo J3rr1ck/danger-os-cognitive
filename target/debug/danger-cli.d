@@ -1,0 +1,1 @@
+/home/danger/danger-os/target/debug/danger-cli: /home/danger/danger-os/crates/cli/src/main.rs /home/danger/danger-os/crates/kernel/src/lib.rs /home/danger/danger-os/crates/kernel/src/memory.rs /home/danger/danger-os/crates/runtime/src/lib.rs /home/danger/danger-os/crates/tools/src/lib.rs
