@@ -5,13 +5,41 @@ use petgraph::algo::toposort;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
+pub struct EventLog {
+    traces: Vec<ExecutionTrace>,
+}
+
+impl EventLog {
+    pub fn new() -> Self {
+        Self { traces: Vec::new() }
+    }
+
+    pub fn push(&mut self, trace: ExecutionTrace) {
+        self.traces.push(trace);
+    }
+
+    pub fn get_traces(&self) -> &[ExecutionTrace] {
+        &self.traces
+    }
+}
+
 pub struct ExecutionEngine {
     registry: ToolRegistry,
+    log: std::sync::Arc<tokio::sync::Mutex<EventLog>>,
 }
 
 impl ExecutionEngine {
     pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry }
+        Self { 
+            registry,
+            log: std::sync::Arc::new(tokio::sync::Mutex::new(EventLog::new())),
+        }
+    }
+
+    pub async fn get_log(&self) -> std::sync::MutexGuard<'_, EventLog> {
+        // This is a bit simplified for the prototype
+        // In a real system, we'd have more robust log management
+        unimplemented!("Use separate log access for real systems")
     }
 
     pub async fn execute(&self, graph: IntentGraph) -> Result<Vec<ExecutionTrace>> {
@@ -45,32 +73,46 @@ impl ExecutionEngine {
             let tool = self.registry.get(&node.tool_name)
                 .ok_or_else(|| anyhow!("Tool not found: {}", node.tool_name))?;
 
+            // CAPABILITY CHECK
+            if tool.capability() != node.capability {
+                return Err(anyhow!(
+                    "Capability mismatch for node {}: tool provides '{}' but node requested '{}'",
+                    node_id, tool.capability(), node.capability
+                ));
+            }
+
             let start_time = std::time::Instant::now();
             let result = tool.execute(serde_json::to_value(&node.inputs)?).await;
             let duration = start_time.elapsed();
 
-            match result {
+            let trace = match result {
                 Ok(output) => {
-                    traces.push(ExecutionTrace {
+                    ExecutionTrace {
                         node_id: node.id.clone(),
                         tool_name: node.tool_name.clone(),
                         status: "Success".to_string(),
                         output: Some(output),
                         error: None,
                         duration_ms: duration.as_millis(),
-                    });
+                    }
                 }
                 Err(e) => {
-                    traces.push(ExecutionTrace {
+                    ExecutionTrace {
                         node_id: node.id.clone(),
                         tool_name: node.tool_name.clone(),
                         status: "Failed".to_string(),
                         output: None,
                         error: Some(e.to_string()),
                         duration_ms: duration.as_millis(),
-                    });
-                    return Err(anyhow!("Execution failed at node {}: {}", node.tool_name, e));
+                    }
                 }
+            };
+
+            self.log.lock().await.push(trace.clone());
+            traces.push(trace);
+
+            if let Some(err) = &traces.last().unwrap().error {
+                return Err(anyhow!("Execution failed at node {}: {}", node.tool_name, err));
             }
         }
 
@@ -78,7 +120,7 @@ impl ExecutionEngine {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 pub struct ExecutionTrace {
     pub node_id: NodeId,
     pub tool_name: String,

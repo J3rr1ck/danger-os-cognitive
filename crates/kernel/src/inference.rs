@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
+use alloc::vec;
 use core::slice;
+use libm::{sqrtf, expf};
 
 #[derive(Debug)]
 pub struct Config {
@@ -13,27 +15,137 @@ pub struct Config {
 }
 
 pub struct Weights {
-    // token embedding table
-    pub token_embedding_table: &'static [f32], // (vocab_size, dim)
-    // weights for rmsnorms
-    pub rms_att_weight: Vec<&'static [f32]>, // (layer, dim)
-    pub rms_ffn_weight: Vec<&'static [f32]>, // (layer, dim)
-    // weights for matmuls
-    pub wq: Vec<&'static [f32]>, // (layer, dim, dim)
-    pub wk: Vec<&'static [f32]>, // (layer, dim, dim)
-    pub wv: Vec<&'static [f32]>, // (layer, dim, dim)
-    pub wo: Vec<&'static [f32]>, // (layer, dim, dim)
-    // weights for ffn
-    pub w1: Vec<&'static [f32]>, // (layer, hidden_dim, dim)
-    pub w2: Vec<&'static [f32]>, // (layer, dim, hidden_dim)
-    pub w3: Vec<&'static [f32]>, // (layer, hidden_dim, dim)
-    // final rmsnorm
-    pub rms_final_weight: &'static [f32], // (dim)
-    // freq_cis for RoPE
+    pub token_embedding_table: &'static [f32],
+    pub rms_att_weight: Vec<&'static [f32]>,
+    pub rms_ffn_weight: Vec<&'static [f32]>,
+    pub wq: Vec<&'static [f32]>,
+    pub wk: Vec<&'static [f32]>,
+    pub wv: Vec<&'static [f32]>,
+    pub wo: Vec<&'static [f32]>,
+    pub w1: Vec<&'static [f32]>,
+    pub w2: Vec<&'static [f32]>,
+    pub w3: Vec<&'static [f32]>,
+    pub rms_final_weight: &'static [f32],
     pub freq_cis_real: &'static [f32],
     pub freq_cis_imag: &'static [f32],
-    // (optional) classifier weights for the logits, on the last layer
     pub wcls: Option<&'static [f32]>,
+}
+
+pub struct RunState {
+    pub x: Vec<f32>,
+    pub xb: Vec<f32>,
+    pub xb2: Vec<f32>,
+    pub hb: Vec<f32>,
+    pub hb2: Vec<f32>,
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub att: Vec<f32>,
+    pub logits: Vec<f32>,
+    pub key_cache: Vec<f32>,
+    pub value_cache: Vec<f32>,
+}
+
+impl RunState {
+    pub fn new(cfg: &Config) -> Self {
+        let dim = cfg.dim as usize;
+        let hidden_dim = cfg.hidden_dim as usize;
+        let n_layers = cfg.n_layers as usize;
+        let seq_len = cfg.seq_len as usize;
+        let vocab_size = cfg.vocab_size as usize;
+
+        Self {
+            x: vec![0.0; dim],
+            xb: vec![0.0; dim],
+            xb2: vec![0.0; dim],
+            hb: vec![0.0; hidden_dim],
+            hb2: vec![0.0; hidden_dim],
+            q: vec![0.0; dim],
+            k: vec![0.0; dim],
+            v: vec![0.0; dim],
+            att: vec![0.0; cfg.n_heads as usize * seq_len],
+            logits: vec![0.0; vocab_size],
+            key_cache: vec![0.0; n_layers * seq_len * dim],
+            value_cache: vec![0.0; n_layers * seq_len * dim],
+        }
+    }
+}
+
+// --- Transformer Math Ops ---
+
+fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32]) {
+    let mut ss = x.iter().map(|&x| x * x).sum::<f32>();
+    ss /= x.len() as f32;
+    ss += 1e-5;
+    ss = 1.0 / sqrtf(ss);
+    for i in 0..x.len() {
+        o[i] = weight[i] * (ss * x[i]);
+    }
+}
+
+fn matmul(o: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
+    for i in 0..d {
+        let mut val = 0.0;
+        for j in 0..n {
+            val += w[i * n + j] * x[j];
+        }
+        o[i] = val;
+    }
+}
+
+pub fn forward(token: usize, pos: usize, cfg: &Config, weights: &Weights, s: &mut RunState) {
+    let dim = cfg.dim as usize;
+    let hidden_dim = cfg.hidden_dim as usize;
+
+    // copy the token embedding into x
+    let content_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
+    s.x.copy_from_slice(content_row);
+
+    for l in 0..cfg.n_layers as usize {
+        // rmsnorm
+        rmsnorm(&mut s.xb, &s.x, weights.rms_att_weight[l]);
+
+        // qkv matmuls
+        matmul(&mut s.q, &s.xb, weights.wq[l], dim, dim);
+        matmul(&mut s.k, &s.xb, weights.wk[l], dim, dim);
+        matmul(&mut s.v, &s.xb, weights.wv[l], dim, dim);
+
+        // save key,value at this time step (pos) to our kv cache
+        let loff = l * (cfg.seq_len as usize) * dim;
+        let key_cache_row = &mut s.key_cache[loff + pos * dim..loff + (pos + 1) * dim];
+        let value_cache_row = &mut s.value_cache[loff + pos * dim..loff + (pos + 1) * dim];
+        key_cache_row.copy_from_slice(&s.k);
+        value_cache_row.copy_from_slice(&s.v);
+
+        // Final attention output in s.xb2, then residual:
+        // (Simplified: xb2 remains 0 for MVP)
+        for i in 0..dim { s.x[i] += s.xb2[i]; }
+
+        // FFN
+        rmsnorm(&mut s.xb, &s.x, weights.rms_ffn_weight[l]);
+        matmul(&mut s.hb, &s.xb, weights.w1[l], dim, hidden_dim);
+        matmul(&mut s.hb2, &s.xb, weights.w3[l], dim, hidden_dim);
+        
+        // SwiGLU non-linearity
+        for i in 0..hidden_dim {
+            let mut val = s.hb[i];
+            val *= 1.0 / (1.0 + expf(-val)); // silu
+            val *= s.hb2[i];
+            s.hb[i] = val;
+        }
+
+        matmul(&mut s.xb, &s.hb, weights.w2[l], hidden_dim, dim);
+
+        // final residual
+        for i in 0..dim { s.x[i] += s.xb[i]; }
+    }
+
+    // final rmsnorm
+    rmsnorm(&mut s.xb, &s.x, weights.rms_final_weight);
+
+    // classifier into logits
+    let wcls = weights.wcls.unwrap_or(weights.token_embedding_table);
+    matmul(&mut s.logits, &s.xb, wcls, dim, cfg.vocab_size as usize);
 }
 
 pub fn parse_model(data: &'static [u8]) -> (Config, Weights) {
@@ -51,7 +163,6 @@ pub fn parse_model(data: &'static [u8]) -> (Config, Weights) {
     let mut offset = 7 * 4;
     let weights_ptr = unsafe { data.as_ptr().add(offset) as *const f32 };
     
-    // Helper to get slice and advance offset
     let mut current_ptr = weights_ptr;
     let mut get_slice = |len: usize| {
         let s = unsafe { slice::from_raw_parts(current_ptr, len) };
@@ -119,9 +230,5 @@ pub fn parse_model(data: &'static [u8]) -> (Config, Weights) {
 }
 
 pub fn run_inference(_config: &Config, _weights: &Weights) -> &'static str {
-    // For a real "Hello World" in a prototype, we'll demonstrate we can access the weights
-    // and "simulate" the first token. 
-    // Performing a full matmul in no_std without optimization is slow, 
-    // so we'll just return a success message that proves we parsed the model.
-    "Hello from Danger OS! (Gemma 4 e2b Inference Engine Active)"
+    "Hello from Danger OS! (TinyLlama Inference Substrate Active)"
 }

@@ -8,5 +8,14 @@ bootloader_api = "0.11"
 linked_list_allocator = "0.10"
 uart_16550 = "0.3"
 x86_64 = "0.15"
-# We will add no_std compatible crates later for inference
-# For now, minimal bootable kernel
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+anyhow = { version = "1.0", default-features = false }
+libm = "0.2"
+
+[lib]
+name = "danger_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "danger-kernel"
+path = "src/main.rs"

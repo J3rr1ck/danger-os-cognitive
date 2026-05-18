@@ -12,6 +12,7 @@ pub struct ToolSchema {
 #[async_trait]
 pub trait CapabilityTool: Send + Sync {
     fn name(&self) -> &str;
+    fn capability(&self) -> &str; // The specific capability this tool provides
     fn schema(&self) -> ToolSchema;
     async fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value>;
 }
@@ -43,6 +44,7 @@ pub struct DebugEchoTool;
 #[async_trait]
 impl CapabilityTool for DebugEchoTool {
     fn name(&self) -> &str { "debug_echo" }
+    fn capability(&self) -> &str { "sys.debug" }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             inputs: [("message".to_string(), "string".to_string())].into(),
@@ -61,6 +63,7 @@ pub struct FileReadTool;
 #[async_trait]
 impl CapabilityTool for FileReadTool {
     fn name(&self) -> &str { "file_read" }
+    fn capability(&self) -> &str { "fs.read" }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             inputs: [("path".to_string(), "string".to_string())].into(),
@@ -81,6 +84,7 @@ pub struct FileWriteTool;
 #[async_trait]
 impl CapabilityTool for FileWriteTool {
     fn name(&self) -> &str { "file_write" }
+    fn capability(&self) -> &str { "fs.write" }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             inputs: [

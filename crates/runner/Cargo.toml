@@ -7,3 +7,4 @@ edition = "2021"
 bootloader = "0.11"
 anyhow = "1.0"
 danger-kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
+clap = { version = "4.0", features = ["derive"] }
