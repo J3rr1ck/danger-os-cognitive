@@ -9,6 +9,74 @@ use alloc::format;
 use serde::{Serialize, Deserialize};
 use alloc::collections::BTreeMap;
 
+// --- Danger OS Substrate ---
+
+pub struct DangerOS {
+    pub engine: ExecutionEngine,
+    pub gate: SymbolicGate,
+    pub vector_store: VectorStore,
+    pub identity: IdentityLayer,
+}
+
+impl DangerOS {
+    pub fn new() -> Self {
+        let registry = default_registry();
+        let policy = Policy::default_user();
+        Self {
+            engine: ExecutionEngine::new(registry),
+            gate: SymbolicGate::new(policy),
+            vector_store: VectorStore::new(),
+            identity: IdentityLayer::new(),
+        }
+    }
+    pub fn process_intent(
+        &mut self, 
+        intent: &str, 
+        config: &inference::Config, 
+        weights: &inference::Weights
+    ) -> anyhow::Result<Vec<ExecutionTrace>> {
+        // 0. Semantic Recall (Lookup)
+        let mut state = inference::RunState::new(config);
+        // Simplified embedding: use the first character's token as a query
+        inference::forward(intent.as_bytes().get(0).cloned().unwrap_or(0) as usize, 0, config, weights, &mut state);
+        
+        let mut traces = Vec::new();
+        if let Some(recalled) = self.vector_store.search(&state.logits) {
+            traces.push(ExecutionTrace {
+                node_id: "semantic_recall".to_string(),
+                tool_name: "memory_lookup".to_string(),
+                status: "Success".to_string(),
+                output: format!("Recalled: {}", recalled),
+                error: None,
+            });
+        }
+
+        // 1. Compilation
+        let graph = compiler::SyscallBridge::compile_model_driven(intent, config, weights);
+
+        // 2. Validation
+        self.gate.validate(&graph)?;
+
+        // 3. Execution
+        let exec_traces = self.engine.execute(&graph)?;
+
+        // 4. Memory Logging (Post-Execution)
+        for trace in &exec_traces {
+            if trace.status == "Success" {
+                // Store in semantic memory if we have an embedding
+                if let Some(node) = graph.nodes.iter().find(|n| n.id == trace.node_id) {
+                    if let Some(logits) = &node.raw_logits {
+                        self.vector_store.store(logits.clone(), format!("Executed {}: {}", trace.tool_name, trace.output));
+                    }
+                }
+            }
+        }
+
+        traces.extend(exec_traces);
+        Ok(traces)
+    }
+}
+
 pub type NodeId = String;
 
 #[cfg(target_os = "none")]
@@ -39,8 +107,130 @@ impl EventLog {
     }
 }
 
-pub struct VectorStore; // Placeholder for v0
-pub struct IdentityLayer; // Placeholder for v0
+pub struct VectorStore {
+    pub storage: Vec<(Vec<f32>, String)>, // Embedding -> Trace Summary
+}
+
+impl VectorStore {
+    pub fn new() -> Self {
+        Self { storage: Vec::new() }
+    }
+
+    pub fn store(&mut self, embedding: Vec<f32>, summary: String) {
+        self.storage.push((embedding, summary));
+    }
+
+    pub fn search(&self, query: &[f32]) -> Option<&String> {
+        // Simple dot product or brute force for v0
+        let mut best_match = None;
+        let mut max_sim = -1.0;
+        
+        for (emb, summary) in &self.storage {
+            let sim = self.cosine_similarity(query, emb);
+            if sim > max_sim {
+                max_sim = sim;
+                best_match = Some(summary);
+            }
+        }
+        best_match
+    }
+
+    fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() { return 0.0; }
+        let mut dot = 0.0;
+        let mut norm_a = 0.0;
+        let mut norm_b = 0.0;
+        for i in 0..a.len() {
+            dot += a[i] * b[i];
+            norm_a += a[i] * a[i];
+            norm_b += b[i] * b[i];
+        }
+        dot / (libm::sqrtf(norm_a) * libm::sqrtf(norm_b) + 1e-5)
+    }
+}
+
+pub struct IdentityLayer {
+    pub behavioral_weights: BTreeMap<String, f32>,
+}
+
+impl IdentityLayer {
+    pub fn new() -> Self {
+        let mut weights = BTreeMap::new();
+        weights.insert("curiosity".to_string(), 0.8);
+        weights.insert("caution".to_string(), 0.9);
+        Self { behavioral_weights: weights }
+    }
+}
+
+// --- Security Model: Policy Engine ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Policy {
+    pub allowed_capabilities: Vec<String>,
+    pub denied_capabilities: Vec<String>,
+    pub mandatory_constraints: Vec<String>,
+}
+
+impl Policy {
+    pub fn default_user() -> Self {
+        Self {
+            allowed_capabilities: Vec::from([
+                "fs.read".to_string(),
+                "fs.write".to_string(),
+                "sys.debug".to_string(),
+                "sys.info".to_string(),
+            ]),
+            denied_capabilities: Vec::from(["sys.admin".to_string()]),
+            mandatory_constraints: Vec::from(["local_only".to_string()]),
+        }
+    }
+}
+
+pub struct SecurityContext {
+    pub current_policy: Policy,
+}
+
+pub struct SymbolicGate {
+    pub context: SecurityContext,
+}
+
+impl SymbolicGate {
+    pub fn new(policy: Policy) -> Self {
+        Self {
+            context: SecurityContext { current_policy: policy },
+        }
+    }
+
+    pub fn validate(&self, graph: &IntentGraph) -> anyhow::Result<()> {
+        if graph.nodes.is_empty() {
+            return Err(anyhow::anyhow!("Empty graph"));
+        }
+
+        for node in &graph.nodes {
+            // 1. Capability Permission Check
+            if self.context.current_policy.denied_capabilities.contains(&node.capability) {
+                return Err(anyhow::anyhow!("Explicitly denied capability: {}", node.capability));
+            }
+            if !self.context.current_policy.allowed_capabilities.contains(&node.capability) {
+                return Err(anyhow::anyhow!("Unauthorized capability: {}", node.capability));
+            }
+
+            // 2. Mandatory Constraint Check
+            for mandatory in &self.context.current_policy.mandatory_constraints {
+                if !node.constraints.contains(mandatory) {
+                    return Err(anyhow::anyhow!("Missing mandatory constraint '{}' for node {}", mandatory, node.id));
+                }
+            }
+
+            // 3. Structural Sanity
+            if node.id.is_empty() || node.tool_name.is_empty() {
+                return Err(anyhow::anyhow!("Malformed node in graph"));
+            }
+        }
+
+        Ok(())
+    }
+}
 
 // --- Tooling System ---
 
@@ -308,33 +498,5 @@ pub mod compiler {
                 }
             }
         }
-    }
-}
-
-pub struct SymbolicGate;
-
-impl SymbolicGate {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn validate(&self, graph: &IntentGraph) -> anyhow::Result<()> {
-        if graph.nodes.is_empty() {
-            return Err(anyhow::anyhow!("Empty graph"));
-        }
-
-        for node in &graph.nodes {
-            // Check for forbidden capabilities (Mock Policy)
-            if node.capability == "sys.admin" {
-                return Err(anyhow::anyhow!("Unauthorized capability: sys.admin"));
-            }
-
-            // Check for node health
-            if node.id.is_empty() || node.tool_name.is_empty() {
-                return Err(anyhow::anyhow!("Malformed node in graph"));
-            }
-        }
-
-        Ok(())
     }
 }
